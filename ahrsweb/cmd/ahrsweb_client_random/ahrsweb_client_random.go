@@ -13,7 +13,7 @@ import (
 	"os"
 	"time"
 
-	"github.com/stratux/goflying/ahrsweb"
+	"github.com/xiaprojects/goflying/ahrsweb"
 	"fmt"
 	"github.com/gorilla/websocket"
 	"net/url"
