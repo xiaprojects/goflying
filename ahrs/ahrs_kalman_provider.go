@@ -23,6 +23,12 @@ import "math"
 //     heading either (a 20 degree error is 8 uT).  "WindSigma" and
 //     "WindNoise" (kt, kt per sqrt(s)) size the wind state; the crab angle
 //     between magnetic heading and GPS track is what makes it observable.
+//   - Without a velocity reference the filter cannot tell gravity from
+//     acceleration and the attitude never becomes observable.  Until a GPS
+//     velocity has been seen it therefore takes a missing fix to mean the
+//     aircraft is standing still, which is what a unit on the bench or on
+//     the apron is; once it has moved, a lost fix leaves the velocity
+//     unmeasured rather than zero.
 //   - Initialisation happens on the first Compute and after Reset, or when
 //     the measurements go stale (maxDT), like SimpleState.
 type KalmanAHRS struct {
@@ -38,6 +44,7 @@ type KalmanAHRS struct {
 	windSigma        float64 // 0: filter default
 	windNoise        float64 // 0: filter default
 	maxSigma         float64 // roll/pitch sigma above which Valid is false, rad
+	flown            bool    // a GPS velocity has been seen since initialisation
 
 	// Aircraft-frame acceleration from the last measurement, for slip/skid and
 	// g-load, smoothed like SimpleState smooths them.
@@ -65,6 +72,15 @@ func NewKalmanAHRS() *KalmanAHRS {
 func (s *KalmanAHRS) adjust(m *Measurement) *Measurement {
 	mm := *m
 	mm.A1, mm.A2, mm.A3 = -m.A1/s.aNorm, -m.A2/s.aNorm, -m.A3/s.aNorm
+	if mm.WValid && math.Hypot(mm.W1, mm.W2) > minGS {
+		s.flown = true
+	}
+	if !mm.WValid && !s.flown {
+		// Standing still until proven otherwise, see the type comment.
+		mm.WValid = true
+		mm.W1, mm.W2, mm.W3 = 0, 0, 0
+		mm.TW = mm.T
+	}
 	return &mm
 }
 
@@ -72,6 +88,7 @@ func (s *KalmanAHRS) adjust(m *Measurement) *Measurement {
 // has configured, since KalmanState.init overwrites the state.
 func (s *KalmanAHRS) initialise(m *Measurement) {
 	s.KalmanState = KalmanState{}
+	s.flown = false
 	s.init(m)
 	s.T = m.T // init leaves it zero, which would read as stale at once
 	if s.f != nil {
