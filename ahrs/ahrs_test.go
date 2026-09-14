@@ -124,18 +124,16 @@ func TestJacobianMeasurement(t *testing.T) {
 		h := s.calcJacobianMeasurement()
 
 		for i := 0; i < 32; i++ {
-			//TODO westphae: don't skip these after working out Jacobian for magnetometer
-			if (i >= 12 && i <= 14) || (i >= 29) {
-				continue
-			}
+			// Perturb on the unit sphere: E and F are renormalised after every
+			// step, so the derivative that matters is of the normalised rotation.
+			saved := *s
 			*(smap[i]) += Small
-			s.calcRotationMatrices()
+			s.normalize()
 			mm := s.PredictMeasurement()
-			*(smap[i]) -= Small
+			*s = saved
 			s.calcRotationMatrices()
 			mmmap := measMap(mm)
-			//TODO westphae: indices all the way up to 15 after working out Jacobian for magnetometer
-			for j := 0; j < 12; j++ {
+			for j := 0; j < 15; j++ {
 				dM := (*(mmmap[j]) - *(mmap[j])) / Small
 				if math.Abs(dM-h.Get(j, i)) > 1e-4 {
 					log.Printf("Error in index %2d,%2d: Calc %6f, Jacobian was %6f\n", j, i, dM, h.Get(j, i))
@@ -384,5 +382,41 @@ func TestMakeHardSoftRotationMatrix(t *testing.T) {
 		log.Printf("s2:  %3f %3f %3f\n", s2[0], s2[1], s2[2])
 		log.Printf("out: %3f %3f %3f\n", out[0], out[1], out[2])
 		t.Fail()
+	}
+}
+
+func TestAngleJacobian(t *testing.T) {
+	rand.Seed(7)
+	for n := 0; n < 200; n++ {
+		q := [4]float64{rand.Float64()*2 - 1, rand.Float64()*2 - 1, rand.Float64()*2 - 1, rand.Float64()*2 - 1}
+		nn := math.Sqrt(q[0]*q[0] + q[1]*q[1] + q[2]*q[2] + q[3]*q[3])
+		for i := range q {
+			q[i] /= nn
+		}
+		phi, theta, _ := FromQuaternion(q[0], q[1], q[2], q[3])
+		if math.Abs(theta) > 80*Deg {
+			continue // gimbal region, derivatives blow up legitimately
+		}
+		j := AngleJacobian(q[0], q[1], q[2], q[3])
+		const h = 1e-7
+		for i := 0; i < 4; i++ {
+			qp := q
+			qp[i] += h
+			phi1, theta1, psi1 := FromQuaternion(qp[0], qp[1], qp[2], qp[3])
+			_, _, psi0 := FromQuaternion(q[0], q[1], q[2], q[3])
+			fd := [3]float64{(phi1 - phi) / h, (theta1 - theta) / h, AngleDiff(psi1, psi0) / h}
+			for a := 0; a < 3; a++ {
+				if math.Abs(fd[a]-j[a][i]) > 1e-4*(1+math.Abs(fd[a])) {
+					t.Errorf("q=%v angle %d dq%d: fd %f jac %f", q, a, i, fd[a], j[a][i])
+				}
+			}
+		}
+	}
+	// A unit-quaternion covariance is rank 3: the norm direction carries none.
+	// Sigmas must be non-negative and equal the diagonal-only case for a
+	// diagonal covariance.
+	r, p, hd := AttitudeSigma([4]float64{1, 0, 0, 0}, [4][4]float64{{0, 0, 0, 0}, {0, 0.01, 0, 0}, {0, 0, 0.01, 0}, {0, 0, 0, 0.01}})
+	if r < 0 || p < 0 || hd < 0 || math.Abs(r-0.2) > 1e-9 || math.Abs(p-0.2) > 1e-9 || math.Abs(hd-0.2) > 1e-9 {
+		t.Errorf("AttitudeSigma at identity: %f %f %f, want 0.2 each (2*sqrt(0.01))", r, p, hd)
 	}
 }

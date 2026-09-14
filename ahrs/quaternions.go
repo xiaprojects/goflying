@@ -43,8 +43,72 @@ func FromQuaternion(q0, q1, q2, q3 float64) (phi float64, theta float64, psi flo
 	return
 }
 
+// AngleJacobian returns the derivatives of the Tait-Bryan angles returned by
+// FromQuaternion with respect to the quaternion components: row 0 is
+// d(phi)/dq, row 1 d(theta)/dq, row 2 d(psi)/dq.
+func AngleJacobian(q0, q1, q2, q3 float64) (j [3][4]float64) {
+	// phi = atan2(rr, qq)
+	rr := 2 * (q0*q1 + q2*q3)
+	qq := q0*q0 - q1*q1 - q2*q2 + q3*q3
+	denom := rr*rr + qq*qq
+	j[0] = [4]float64{
+		(2*q1*qq - 2*q0*rr) / denom,
+		(2*q0*qq + 2*q1*rr) / denom,
+		(2*q3*qq + 2*q2*rr) / denom,
+		(2*q2*qq - 2*q3*rr) / denom,
+	}
+	// theta = asin(-rr/qq)
+	rr = 2 * (q0*q2 - q1*q3)
+	qq = q0*q0 + q1*q1 + q2*q2 + q3*q3
+	denom = qq * math.Sqrt(qq*qq-rr*rr)
+	if denom > 0 {
+		j[1] = [4]float64{
+			(2*q0*rr - 2*q2*qq) / denom,
+			(2*q1*rr + 2*q3*qq) / denom,
+			(2*q2*rr - 2*q0*qq) / denom,
+			(2*q3*rr + 2*q1*qq) / denom,
+		}
+	}
+	// psi = pi/2 - atan2(rr, qq)
+	rr = 2 * (q0*q3 + q1*q2)
+	qq = q0*q0 + q1*q1 - q2*q2 - q3*q3
+	denom = rr*rr + qq*qq
+	j[2] = [4]float64{
+		(-2*q3*qq + 2*q0*rr) / denom,
+		(-2*q2*qq + 2*q1*rr) / denom,
+		(-2*q1*qq - 2*q2*rr) / denom,
+		(-2*q0*qq - 2*q3*rr) / denom,
+	}
+	return
+}
+
+// AttitudeSigma returns the standard deviations of roll, pitch and heading
+// for the quaternion q with covariance cov, to first order: sqrt(J cov J^T)
+// per angle.  Unlike VarFromQuaternion it uses the full covariance, which
+// for a unit quaternion is far from diagonal, and cannot go negative.
+func AttitudeSigma(q [4]float64, cov [4][4]float64) (roll, pitch, heading float64) {
+	j := AngleJacobian(q[0], q[1], q[2], q[3])
+	var out [3]float64
+	for a := 0; a < 3; a++ {
+		var v float64
+		for i := 0; i < 4; i++ {
+			for k := 0; k < 4; k++ {
+				v += j[a][i] * cov[i][k] * j[a][k]
+			}
+		}
+		if v > 0 {
+			out[a] = math.Sqrt(v)
+		}
+	}
+	return out[0], out[1], out[2]
+}
+
 // VarFromQuaternion returns the standard deviation of the Tate-Bryan angles phi, theta, psi
 // corresponding to the quaternion q0, q1, q2, q3 with stdev dq0, dq1, dq2, dq3
+//
+// Deprecated: this is a signed sum of first-order terms over a diagonal
+// covariance, so it can come out negative and ignores the correlations of a
+// unit quaternion; use AttitudeSigma.
 func VarFromQuaternion(q0, q1, q2, q3, dq0, dq1, dq2, dq3 float64) (float64, float64, float64) {
 	var qq, rr, denom float64
 	rr = 2 * (q0*q1 + q2*q3)
@@ -63,7 +127,7 @@ func VarFromQuaternion(q0, q1, q2, q3, dq0, dq1, dq2, dq3 float64) (float64, flo
 	dthetadq3 := (2*q3*rr + 2*q1*qq) / denom
 	rr = 2 * (q0*q3 + q1*q2)
 	qq = q0*q0 + q1*q1 - q2*q2 - q3*q3
-	denom = 4*(q0*q3-q1*q2)*(q0*q3-q1*q2) + qq*qq
+	denom = rr*rr + qq*qq
 	dpsidq0 := (-2*q3*qq + 2*q0*rr) / denom
 	dpsidq1 := (-2*q2*qq + 2*q1*rr) / denom
 	dpsidq2 := (-2*q1*qq - 2*q2*rr) / denom

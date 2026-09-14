@@ -13,10 +13,13 @@ type KalmanState struct {
 }
 
 func (s *KalmanState) CalcRollPitchHeadingUncertainty() (droll float64, dpitch float64, dheading float64) {
-	droll, dpitch, dheading = VarFromQuaternion(s.E0, s.E1, s.E2, s.E3,
-		math.Sqrt(s.M.Get(6, 6)), math.Sqrt(s.M.Get(7, 7)),
-		math.Sqrt(s.M.Get(8, 8)), math.Sqrt(s.M.Get(9, 9)))
-	return
+	var cov [4][4]float64
+	for i := 0; i < 4; i++ {
+		for k := 0; k < 4; k++ {
+			cov[i][k] = s.M.Get(6+i, 6+k)
+		}
+	}
+	return AttitudeSigma([4]float64{s.E0, s.E1, s.E2, s.E3}, cov)
 }
 
 // GetState returns the Kalman state of the system
@@ -170,14 +173,6 @@ func (s *KalmanState) Predict(t float64) {
 // Update applies the Kalman filter corrections given the measurements
 func (s *KalmanState) Update(m *Measurement) {
 	z := s.PredictMeasurement()
-
-	//TODO westphae: for testing, if no GPS, we're probably inside at a desk - assume zero groundspeed
-	if !m.WValid {
-		m.W1 = 0
-		m.W2 = 0
-		m.W3 = 0
-		m.WValid = true
-	}
 
 	y := matrix.Zeros(15, 1)
 	y.Set(0, 0, m.U1-z.U1)
@@ -668,7 +663,6 @@ func (s *KalmanState) calcJacobianMeasurement() (jac *matrix.DenseMatrix) {
 			2*af3*s.F3)
 
 	b1 := s.f11*h1 + s.f12*h2 + s.f13*h3
-	bf1 := b1 + s.D1
 	jac.Set(9, 6, // B1/E0
 		2*(s.E0*s.H1+s.E3*s.H2-s.E2*s.H3)*s.f11+
 			2*(-s.E3*s.H1+s.E0*s.H2+s.E1*s.H3)*s.f12+
@@ -693,17 +687,16 @@ func (s *KalmanState) calcJacobianMeasurement() (jac *matrix.DenseMatrix) {
 	jac.Set(9, 11, s.e21*s.f11+s.e22*s.f12+s.e23*s.f13) // B1/H2
 	jac.Set(9, 12, s.e31*s.f11+s.e32*s.f12+s.e33*s.f13) // B1/H3
 	jac.Set(9, 22, 2*(h1*s.F0-h2*s.F3+h3*s.F2)-         // B1/F0
-		2*bf1*s.F0)
+		2*b1*s.F0)
 	jac.Set(9, 23, 2*(h1*s.F1+h2*s.F2+h3*s.F3)- // B1/F1
-		2*bf1*s.F1)
+		2*b1*s.F1)
 	jac.Set(9, 24, 2*(-h1*s.F2+h2*s.F1+h3*s.F0)- // B1/F2
-		2*bf1*s.F2)
+		2*b1*s.F2)
 	jac.Set(9, 25, 2*(-h1*s.F3-h2*s.F0+h3*s.F1)- // B1/F3
-		2*bf1*s.F3)
+		2*b1*s.F3)
 	jac.Set(9, 26, 1) // B1/D1
 
 	b2 := s.f21*h1 + s.f22*h2 + s.f23*h3
-	bf2 := b2 + s.D2
 	jac.Set(10, 6, // B2/E0
 		2*(s.E0*s.H1+s.E3*s.H2-s.E2*s.H3)*s.f21+
 			2*(-s.E3*s.H1+s.E0*s.H2+s.E1*s.H3)*s.f22+
@@ -728,17 +721,16 @@ func (s *KalmanState) calcJacobianMeasurement() (jac *matrix.DenseMatrix) {
 	jac.Set(10, 11, s.e21*s.f21+s.e22*s.f22+s.e23*s.f23) // B2/H2
 	jac.Set(10, 12, s.e31*s.f21+s.e32*s.f22+s.e33*s.f23) // B2/H3
 	jac.Set(10, 22, 2*(h1*s.F3+h2*s.F0-h3*s.F1)-         // B2/F0
-		2*bf2*s.F0)
+		2*b2*s.F0)
 	jac.Set(10, 23, 2*(h1*s.F2-h2*s.F1-h3*s.F0)- // B2/F1
-		2*bf2*s.F1)
+		2*b2*s.F1)
 	jac.Set(10, 24, 2*(h1*s.F1+h2*s.F2+h3*s.F3)- // B2/F2
-		2*bf2*s.F2)
+		2*b2*s.F2)
 	jac.Set(10, 25, 2*(h1*s.F0-h2*s.F3+h3*s.F2)- // B2/F3
-		2*bf2*s.F3)
+		2*b2*s.F3)
 	jac.Set(10, 27, 1) // B2/D2
 
 	b3 := s.f31*h1 + s.f32*h2 + s.f33*h3
-	bf3 := b3 + s.D3
 	jac.Set(11, 6, // B3/E0
 		2*(s.E0*s.H1+s.E3*s.H2-s.E2*s.H3)*s.f31+
 			2*(-s.E3*s.H1+s.E0*s.H2+s.E1*s.H3)*s.f32+
@@ -763,51 +755,87 @@ func (s *KalmanState) calcJacobianMeasurement() (jac *matrix.DenseMatrix) {
 	jac.Set(11, 11, s.e21*s.f31+s.e22*s.f32+s.e23*s.f33) // B3/H2
 	jac.Set(11, 12, s.e31*s.f31+s.e32*s.f32+s.e33*s.f33) // B3/H3
 	jac.Set(11, 22, 2*(-h1*s.F2+h2*s.F1+h3*s.F0)-        // B3/F0
-		2*bf3*s.F0)
+		2*b3*s.F0)
 	jac.Set(11, 23, 2*(h1*s.F3+h2*s.F0-h3*s.F1)- // B3/F1
-		2*bf3*s.F1)
+		2*b3*s.F1)
 	jac.Set(11, 24, 2*(-h1*s.F0+h2*s.F3-h3*s.F2)- // B3/F2
-		2*bf3*s.F2)
+		2*b3*s.F2)
 	jac.Set(11, 25, 2*(h1*s.F1+h2*s.F2+h3*s.F3)- // B3/F3
-		2*bf3*s.F3)
+		2*b3*s.F3)
 	jac.Set(11, 28, 1) // B3/D3
 
-	//TODO westphae: fix these
-	/*
-		m1 :=  s.N1*s.e11 + s.N2*s.e21 + s.N3*s.e31 + s.L1
-		m2 :=  s.N1*s.e12 + s.N2*s.e22 + s.N3*s.e32 + s.L2
-		m3 :=  s.N1*s.e13 + s.N2*s.e23 + s.N3*s.e33 + s.L3
+	// Magnetometer: M = F.(E^T N + L), see PredictMeasurement.  Written with
+	// the rotation-matrix derivatives rather than expanded, and with the same
+	// on-sphere projection (-2 q_i * value) the rows above use for E and F.
+	{
+		// dR/dq_i for a quaternion q, matching calcRotationMatrices.
+		dR := func(q0, q1, q2, q3 float64) [4][3][3]float64 {
+			return [4][3][3]float64{
+				{{2 * q0, -2 * q3, 2 * q2}, {2 * q3, 2 * q0, -2 * q1}, {-2 * q2, 2 * q1, 2 * q0}},
+				{{2 * q1, 2 * q2, 2 * q3}, {2 * q2, -2 * q1, -2 * q0}, {2 * q3, 2 * q0, -2 * q1}},
+				{{-2 * q2, 2 * q1, 2 * q0}, {2 * q1, 2 * q2, 2 * q3}, {-2 * q0, 2 * q3, -2 * q2}},
+				{{-2 * q3, -2 * q0, 2 * q1}, {2 * q0, -2 * q3, 2 * q2}, {2 * q1, 2 * q2, 2 * q3}},
+			}
+		}
+		e := [3][3]float64{{s.e11, s.e12, s.e13}, {s.e21, s.e22, s.e23}, {s.e31, s.e32, s.e33}}
+		f := [3][3]float64{{s.f11, s.f12, s.f13}, {s.f21, s.f22, s.f23}, {s.f31, s.f32, s.f33}}
+		N := [3]float64{s.N1, s.N2, s.N3}
+		L := [3]float64{s.L1, s.L2, s.L3}
+		E := [4]float64{s.E0, s.E1, s.E2, s.E3}
+		F := [4]float64{s.F0, s.F1, s.F2, s.F3}
+		dRE := dR(E[0], E[1], E[2], E[3])
+		dRF := dR(F[0], F[1], F[2], F[3])
 
-		m.M1 = s.f11*m1 + s.f21*m2 + s.f31*m3 + s.L1
-		jac.Set(12, 6, 2*(+s.E0*s.N1 - s.E3*s.N2 + s.E2*s.N3))         // M1/E0
-		jac.Set(12, 7, 2*(+s.E1*s.N1 + s.E2*s.N2 + s.E3*s.N3))         // M1/E1
-		jac.Set(12, 8, 2*(-s.E2*s.N1 + s.E1*s.N2 + s.E0*s.N3))         // M1/E2
-		jac.Set(12, 9, 2*(-s.E3*s.N1 - s.E0*s.N2 + s.E1*s.N3))         // M1/E3
-		jac.Set(12, 13, 2*(s.E1*s.E1+s.E0*s.E0-0.5))                   // M1/N1
-		jac.Set(12, 14, 2*(s.E1*s.E2-s.E0*s.E3))                       // M1/N2
-		jac.Set(12, 15, 2*(s.E1*s.E3+s.E0*s.E2))                       // M1/N3
-		jac.Set(12, 29, 1)                                             // M1/L1
-
-		m.M2 = s.f12*m1 + s.f22*m2 + s.f32*m3 + s.L2
-		jac.Set(13, 6,  2*(+s.E3*s.N1 + s.E0*s.N2 - s.E1*s.N3))        // M2/E0
-		jac.Set(13, 7,  2*(+s.E2*s.N1 - s.E1*s.N2 - s.E0*s.N3))        // M2/E1
-		jac.Set(13, 8,  2*(+s.E1*s.N1 + s.E2*s.N2 + s.E3*s.N3))        // M2/E2
-		jac.Set(13, 9,  2*(+s.E0*s.N1 - s.E3*s.N2 + s.E2*s.N3))        // M2/E3
-		jac.Set(13, 13, 2*(s.E2*s.E1 + s.E0*s.E3))                     // M2/N1
-		jac.Set(13, 14, 2*(s.E2*s.E2 + s.E0*s.E0 - 0.5))               // M2/N2
-		jac.Set(13, 15, 2*(s.E2*s.E3 - s.E0*s.E1))                     // M2/N3
-		jac.Set(13, 30, 1)                                             // M2/L2
-
-		m.M3 = s.f13*m1 + s.f23*m2 + s.f33*m3 + s.L3
-		jac.Set(14, 6,  2*(-s.E2*s.N1 + s.E1*s.N2 + s.E0*s.N3))        // M3/E0
-		jac.Set(14, 7,  2*(+s.E3*s.N1 + s.E0*s.N2 - s.E1*s.N3))        // M3/E1
-		jac.Set(14, 8,  2*(-s.E0*s.N1 + s.E3*s.N2 - s.E2*s.N3))        // M3/E2
-		jac.Set(14, 9,  2*(+s.E1*s.N1 + s.E2*s.N2 + s.E3*s.N3))        // M3/E3
-		jac.Set(14, 13, 2*(s.E3*s.E1 - s.E0*s.E2))                     // M3/N1
-		jac.Set(14, 14, 2*(s.E3*s.E2 + s.E0*s.E1))                     // M3/N2
-		jac.Set(14, 15, 2*(s.E3*s.E3 + s.E0*s.E0 - 0.5))               // M3/N3
-		jac.Set(14, 31, 1)                                             // M3/L3
-	*/
+		// r = E^T N (aircraft frame), m = r + L, M = F m (sensor frame).
+		var r, m, M [3]float64
+		for j := 0; j < 3; j++ {
+			for k := 0; k < 3; k++ {
+				r[j] += N[k] * e[k][j]
+			}
+			m[j] = r[j] + L[j]
+		}
+		for i := 0; i < 3; i++ {
+			for j := 0; j < 3; j++ {
+				M[i] += f[i][j] * m[j]
+			}
+		}
+		for i := 0; i < 3; i++ {
+			row := 12 + i
+			// dM_i/dE_q = sum_j f_ij (dR_q^T N)_j - 2 E_q * sum_j f_ij r_j
+			for q := 0; q < 4; q++ {
+				var v, fr float64
+				for j := 0; j < 3; j++ {
+					var dr float64
+					for k := 0; k < 3; k++ {
+						dr += N[k] * dRE[q][k][j]
+					}
+					v += f[i][j] * dr
+					fr += f[i][j] * r[j]
+				}
+				jac.Set(row, 6+q, v-2*E[q]*fr)
+			}
+			// dM_i/dN_k = sum_j f_ij e_kj
+			for k := 0; k < 3; k++ {
+				var v float64
+				for j := 0; j < 3; j++ {
+					v += f[i][j] * e[k][j]
+				}
+				jac.Set(row, 13+k, v)
+			}
+			// dM_i/dF_q = (dR_q m)_i - 2 F_q M_i
+			for q := 0; q < 4; q++ {
+				var v float64
+				for j := 0; j < 3; j++ {
+					v += dRF[q][i][j] * m[j]
+				}
+				jac.Set(row, 22+q, v-2*F[q]*M[i])
+			}
+			// dM_i/dL_j = f_ij
+			for j := 0; j < 3; j++ {
+				jac.Set(row, 29+j, f[i][j])
+			}
+		}
+	}
 
 	return
 }
