@@ -82,17 +82,7 @@ func (s *KalmanAHRS) initialise(m *Measurement) {
 	// The bias state starts at zero: the calibration went into aNorm.
 	s.C1, s.C2, s.C3 = 0, 0, 0
 
-	if s.magField > 0 {
-		// Earth frame is east, north, up: the field points to magnetic north
-		// and, in the northern hemisphere, down.
-		s.N1 = 0
-		s.N2 = s.magField * math.Cos(s.magDip*Deg)
-		s.N3 = -s.magField * math.Sin(s.magDip*Deg)
-		for i := 13; i <= 15; i++ {
-			s.M.Set(i, i, 0.01)
-			s.N.Set(i, i, 1e-6)
-		}
-	}
+	s.applyField()
 	for i := 29; i <= 31; i++ {
 		s.M.Set(i, i, s.magBiasSigma*s.magBiasSigma)
 	}
@@ -107,6 +97,23 @@ func (s *KalmanAHRS) initialise(m *Measurement) {
 		}
 	}
 	s.needsInit = false
+}
+
+// applyField pins the earth field state N to the configured local field.
+// Earth frame is east, north, up: the field points to magnetic north and, in
+// the northern hemisphere, down.  Cheap enough to redo whenever the reference
+// moves, e.g. with the aircraft's position, without restarting the filter.
+func (s *KalmanAHRS) applyField() {
+	if s.magField <= 0 || s.M == nil {
+		return
+	}
+	s.N1 = 0
+	s.N2 = s.magField * math.Cos(s.magDip*Deg)
+	s.N3 = -s.magField * math.Sin(s.magDip*Deg)
+	for i := 13; i <= 15; i++ {
+		s.M.Set(i, i, 0.01)
+		s.N.Set(i, i, 1e-6)
+	}
 }
 
 // Compute runs a predict/update cycle, initialising first when needed.
@@ -222,14 +229,20 @@ func (s *KalmanAHRS) GetCalibrations() (c, d *[3]float64) {
 }
 
 // SetConfig sets the local magnetic field and the priors described in the
-// type comment.  A change takes effect at the next initialisation; call Reset
-// to force one.
+// type comment.  The field takes effect at once; the priors at the next
+// initialisation (call Reset to force one).
 func (s *KalmanAHRS) SetConfig(configMap map[string]float64) {
+	field := false
 	if v, ok := configMap["MagField"]; ok {
 		s.magField = v
+		field = true
 	}
 	if v, ok := configMap["MagDip"]; ok {
 		s.magDip = v
+		field = true
+	}
+	if field && !s.needsInit {
+		s.applyField()
 	}
 	if v, ok := configMap["MagBiasSigma"]; ok && v > 0 {
 		s.magBiasSigma = v
