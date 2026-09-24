@@ -106,10 +106,24 @@ type MPU9250 struct {
 	enableMag             bool
 	mpuCalData
 	mcal1, mcal2, mcal3 float64         // Hardware magnetometer calibration values, uT
+	tempScale           float64         // Die temperature: degC per LSB, see tempConversion
+	tempOffset          float64         // Die temperature at 0 LSB, degC
 	C                   <-chan *MPUData // Current instantaneous sensor values
 	CAvg                <-chan *MPUData // Average sensor values (since CAvg last read)
 	CBuf                <-chan *MPUData // Buffer of instantaneous sensor values
 	cClose              chan bool       // Turn off MPU polling
+}
+
+// tempConversion returns the die temperature conversion, degC = raw*scale +
+// offset, for the chip identified by its WHO_AM_I value.  The MPU-6000/6050/9150
+// (0x68) use 340 LSB/degC with 0 LSB at 36.53 degC; the MPU-9250/9255/6500 and
+// their clones use 333.87 LSB/degC with 0 LSB at 21 degC.  Applying the older
+// formula to the newer chips reads about 15 degC high.
+func tempConversion(whoAmI byte) (scale, offset float64) {
+	if whoAmI == 0x68 {
+		return 1 / 340.0, 36.53
+	}
+	return 1 / 333.87, 21.0
 }
 
 /*
@@ -139,6 +153,15 @@ func NewMPU9250(i2cbus *embd.I2CBus, sensitivityGyro, sensitivityAccel, sampleRa
 	if err := mpu.i2cWrite(MPUREG_PWR_MGMT_1, 0x00); err != nil {
 		return nil, errors.New("Error waking MPU9250")
 	}
+
+	// This driver serves the whole family and the temperature sensor differs
+	// between its generations, so identify the chip for the conversion.
+	whoAmI, err := mpu.i2cRead(MPUREG_WHOAMI)
+	if err != nil {
+		log.Printf("MPU9250: could not read WHO_AM_I (%v), assuming an MPU-9250 temperature sensor\n", err)
+		whoAmI = 0x71
+	}
+	mpu.tempScale, mpu.tempOffset = tempConversion(whoAmI)
 
 	// Note: inv_mpu.c sets some registers here to allocate 1kB to the FIFO buffer and 3kB to the DMP.
 	// It doesn't seem to be supported in the 1.6 version of the register map and we're not using FIFO anyway,
@@ -341,7 +364,7 @@ func (mpu *MPU9250) readSensors() {
 			M1:      mpu.Ms11*mm1 + mpu.Ms12*mm2 + mpu.Ms13*mm3,
 			M2:      mpu.Ms21*mm1 + mpu.Ms22*mm2 + mpu.Ms23*mm3,
 			M3:      mpu.Ms31*mm1 + mpu.Ms32*mm2 + mpu.Ms33*mm3,
-			Temp:    float64(tmp)/340 + 36.53,
+			Temp:    float64(tmp)*mpu.tempScale + mpu.tempOffset,
 			GAError: gaError, MagError: magError,
 			N: 1, NM: 1,
 			T: t, TM: tm,
@@ -368,7 +391,7 @@ func (mpu *MPU9250) readSensors() {
 			d.A1 = (ava1/n - mpu.A01) * mpu.scaleAccel
 			d.A2 = (ava2/n - mpu.A02) * mpu.scaleAccel
 			d.A3 = (ava3/n - mpu.A03) * mpu.scaleAccel
-			d.Temp = (float64(avtmp)/n)/340 + 36.53
+			d.Temp = (float64(avtmp)/n)*mpu.tempScale + mpu.tempOffset
 			d.N = int(n + 0.5)
 			d.T = t
 			d.DT = t.Sub(t0)
