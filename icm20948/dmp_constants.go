@@ -130,6 +130,14 @@ const (
 	BITS_FS_8G  = 0x04 // ACCEL_CONFIG
 	BITS_FS_16G = 0x06 // ACCEL_CONFIG
 
+	// Field masks for GYRO_CONFIG_1 (Bank 2, 0x01) and ACCEL_CONFIG (Bank 2, 0x14).
+	// Both share the layout: [5:3] DLPFCFG, [2:1] FS_SEL, [0] FCHOICE (1 = DLPF on).
+	// Needed so that setting the filter does not clobber the full-scale range and
+	// vice versa. Note these are NOT the same as the MPU9250 BITS_*_MASK values
+	// further down in this file, which are leftovers from that chip's layout.
+	BITS_ICM_DLPF_MASK   = 0x39 // DLPFCFG [5:3] + FCHOICE [0]
+	BITS_ICM_FS_SEL_MASK = 0x06 // FS_SEL [2:1]
+
 	// Reg bank 3.
 	ICMREG_I2C_MST_CTRL  = 0x01
 	ICMREG_I2C_SLV0_ADDR = 0x03

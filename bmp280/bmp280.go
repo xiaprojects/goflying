@@ -23,8 +23,10 @@ const (
 	// Chip ID Definitions
 	ChipID1 = 0x56
 	ChipID2 = 0x57
-	ChipID3 = 0x58
-	ChipID4 = 0x60
+	ChipID3 = 0x58 // BMP280 (pressure + temperature)
+	ChipID4 = 0x60 // BME280 (pressure + temperature + humidity)
+	// ChipIDBME280 is an alias for ChipID4, used where humidity support matters.
+	ChipIDBME280 = ChipID4
 	// Power Mode Definitions
 	SleepMode     = 0x00
 	ForcedMode    = 0x01
@@ -73,6 +75,13 @@ const (
 	RegisterTempDataLSB   = 0xFB
 	RegisterTempDataXLSB  = 0xFC
 
+	// BME280-only registers (chip ID 0x60): humidity control, calibration and data
+	RegisterCtrlHum      = 0xF2 // osrs_h[2:0]; must be written before RegisterControl to take effect
+	RegisterHumCompData1 = 0xA1 // dig_H1 (1 byte)
+	RegisterHumCompData2 = 0xE1 // dig_H2..dig_H6 (7 bytes)
+	RegisterHumDataMSB   = 0xFD
+	RegisterHumDataLSB   = 0xFE
+
 	// Connection retries definition
 	ConnAttempts = 5
 
@@ -87,18 +96,21 @@ const (
 )
 
 type BMPData struct {
-	Temperature float64
-	Pressure    float64
-	T           time.Duration
+	Temperature float64       // Temperature, degrees C
+	Pressure    float64       // Barometric pressure, hPa
+	Humidity    float64       // Relative humidity, percent; 0 if the chip has no humidity sensor (plain BMP280)
+	T           time.Duration // Time since the driver was started
 }
 
 type BMP280 struct {
 	i2cbus *embd.I2CBus
 
-	address byte
-	chipID  byte
-	config  byte
-	control byte
+	address     byte
+	chipID      byte
+	config      byte
+	control     byte
+	humControl  byte // ctrl_hum value (BME280 only)
+	hasHumidity bool // true when chipID == ChipIDBME280
 
 	t time.Time
 
@@ -106,6 +118,7 @@ type BMP280 struct {
 
 	DigT map[int]int32
 	DigP map[int]int64
+	DigH map[int]int32 // Humidity compensation words dig_H1..dig_H6 (BME280 only)
 
 	T_fine int32
 
@@ -148,6 +161,7 @@ func NewBMP280(i2cbus *embd.I2CBus, address, powerMode, standby, filter, tempRes
 	}
 
 	bmp.chipID = v[0]
+	bmp.hasHumidity = bmp.chipID == ChipIDBME280
 
 	bmp.config = (standby << 5) + (filter << 2)               // combine bits for config
 	bmp.control = (tempRes << 5) + (presRes << 2) + powerMode // combine bits for control
@@ -158,6 +172,15 @@ func NewBMP280(i2cbus *embd.I2CBus, address, powerMode, standby, filter, tempRes
 	bmp.i2cWrite(RegisterSoftReset, SoftResetCode) // reset sensor
 	time.Sleep(ReadDelay)
 
+	if bmp.hasHumidity {
+		// On the BME280 the humidity oversampling (ctrl_hum) must be written
+		// before ctrl_meas (RegisterControl) or the change is ignored.
+		// Humidity changes slowly, so 1x oversampling is plenty.
+		bmp.humControl = Oversamp1x
+		bmp.i2cWrite(RegisterCtrlHum, bmp.humControl)
+		time.Sleep(ReadDelay)
+	}
+
 	bmp.i2cWrite(RegisterControl, bmp.control) //
 	time.Sleep(ReadDelay)
 	bmp.i2cWrite(RegisterConfig, bmp.config) //
@@ -165,6 +188,7 @@ func NewBMP280(i2cbus *embd.I2CBus, address, powerMode, standby, filter, tempRes
 
 	bmp.DigT = make(map[int]int32)
 	bmp.DigP = make(map[int]int64)
+	bmp.DigH = make(map[int]int32)
 	bmp.ReadCorrectionSettings()
 
 	go bmp.readSensor()
@@ -207,19 +231,52 @@ func (bmp *BMP280) ReadCorrectionSettings() (err error) {
 		bmp.DigP[i+1] = int64(int16(raw[2*i+7])<<8 + int16(raw[2*i+6]))
 	}
 
+	if bmp.hasHumidity {
+		if errh := bmp.readHumidityCorrectionSettings(); errh != nil && err == nil {
+			err = errh
+		}
+	}
+
+	return
+}
+
+// readHumidityCorrectionSettings loads the BME280 humidity compensation words
+// dig_H1..dig_H6. dig_H1 lives on its own at 0xA1; dig_H2..dig_H6 are packed
+// into the 7 bytes starting at 0xE1 (BME280 datasheet Table 16).
+func (bmp *BMP280) readHumidityCorrectionSettings() (err error) {
+	h1 := make([]byte, 1)
+	if errf := bmp.i2cReadBytes(RegisterHumCompData1, h1); errf != nil {
+		return fmt.Errorf("BMP280: Error reading humidity calibration (dig_H1): %s", errf)
+	}
+	e := make([]byte, 7)
+	if errf := bmp.i2cReadBytes(RegisterHumCompData2, e); errf != nil {
+		return fmt.Errorf("BMP280: Error reading humidity calibration (dig_H2..dig_H6): %s", errf)
+	}
+
+	bmp.DigH[1] = int32(h1[0])                                 // unsigned
+	bmp.DigH[2] = int32(int16(uint16(e[1])<<8 | uint16(e[0]))) // signed, little-endian
+	bmp.DigH[3] = int32(e[2])                                  // unsigned
+	bmp.DigH[4] = int32(int8(e[3]))<<4 | int32(e[4]&0x0F)      // signed, 12-bit packed
+	bmp.DigH[5] = int32(int8(e[5]))<<4 | int32(e[4]>>4)        // signed, 12-bit packed
+	bmp.DigH[6] = int32(int8(e[6]))                            // signed
+
 	return
 }
 
 func (bmp *BMP280) readSensor() {
 	var (
-		raw_temp    int32
-		raw_press   int64
-		temp, press float64
-		err         error
-		t           time.Time
+		raw_temp         int32
+		raw_press        int64
+		raw_hum          int32
+		temp, press, hum float64
+		err              error
+		t                time.Time
 	)
 
 	raw := make([]byte, 6)
+	if bmp.hasHumidity {
+		raw = make([]byte, 8) // press[3] + temp[3] + hum[2], contiguous from 0xF7
+	}
 
 	cC := make(chan *BMPData)
 	defer close(cC)
@@ -238,6 +295,7 @@ func (bmp *BMP280) readSensor() {
 		d := BMPData{
 			Temperature: temp,
 			Pressure:    press,
+			Humidity:    hum,
 			T:           t.Sub(bmp.t),
 		}
 		return &d
@@ -258,6 +316,11 @@ func (bmp *BMP280) readSensor() {
 
 			temp = bmp.CalcCompensatedTemp(raw_temp)
 			press = bmp.CalcCompensatedPress(raw_press)
+
+			if bmp.hasHumidity {
+				raw_hum = (int32(raw[6]) << 8) + int32(raw[7])
+				hum = bmp.CalcCompensatedHumidity(raw_hum)
+			}
 		case cC <- makeBMPData(): // Send the latest values
 		case cBuf <- makeBMPData():
 		case <-bmp.cClose: // Stop the goroutine, ease up on the CPU
@@ -296,6 +359,31 @@ func (bmp *BMP280) CalcCompensatedPress(raw_press int64) (press float64) {
 	p = ((p + var1 + var2) >> 8) + (bmp.DigP[7] << 4)
 	press = float64(p) / 25600
 	return
+}
+
+// CalcCompensatedHumidity converts a raw BME280 humidity reading into percent
+// relative humidity, using the floating-point compensation formula from the
+// BME280 datasheet (section 8.1). It relies on T_fine, so CalcCompensatedTemp
+// must have been run for the same sample first. Only meaningful when the
+// connected chip is a BME280 (HasHumiditySensor returns true).
+func (bmp *BMP280) CalcCompensatedHumidity(raw_hum int32) (humidity float64) {
+	h := float64(bmp.T_fine) - 76800.0
+	h = (float64(raw_hum) - (float64(bmp.DigH[4])*64.0 + float64(bmp.DigH[5])/16384.0*h)) *
+		(float64(bmp.DigH[2]) / 65536.0 * (1.0 + float64(bmp.DigH[6])/67108864.0*h*
+			(1.0+float64(bmp.DigH[3])/67108864.0*h)))
+	h = h * (1.0 - float64(bmp.DigH[1])*h/524288.0)
+	if h > 100.0 {
+		h = 100.0
+	} else if h < 0.0 {
+		h = 0.0
+	}
+	return h
+}
+
+// HasHumiditySensor reports whether the connected chip is a BME280 and therefore
+// fills in BMPData.Humidity. A plain BMP280 returns false and Humidity stays 0.
+func (bmp *BMP280) HasHumiditySensor() bool {
+	return bmp.hasHumidity
 }
 
 func CalcAltitude(press float64) (altitude float64) {
@@ -370,6 +458,30 @@ func (bmp *BMP280) SetOversampTemp(oversampTemp byte) error {
 	time.Sleep(bmp.Delay)
 	if errv := bmp.i2cWrite(RegisterControl, v[0]); errv != nil {
 		return fmt.Errorf("BMP280 Error: Couldn't write Temperature Oversampling: %s", errv)
+	}
+	return nil
+}
+
+// GetOversampHum returns the current humidity oversampling setting (BME280 only).
+func (bmp *BMP280) GetOversampHum() (oversampHum byte, err error) {
+	v := make([]byte, 1)
+	if errv := bmp.i2cReadBytes(RegisterCtrlHum, v); errv != nil {
+		err = fmt.Errorf("BMP280 Error: Couldn't read Humidity Oversampling: %s", errv)
+		return
+	}
+	oversampHum = v[0] & 0x07
+	return
+}
+
+// SetOversampHum sets the humidity oversampling (BME280 only). Per the datasheet
+// a write to ctrl_meas is required afterwards for the change to take effect.
+func (bmp *BMP280) SetOversampHum(oversampHum byte) error {
+	if errv := bmp.i2cWrite(RegisterCtrlHum, oversampHum&0x07); errv != nil {
+		return fmt.Errorf("BMP280 Error: Couldn't write Humidity Oversampling: %s", errv)
+	}
+	bmp.humControl = oversampHum & 0x07
+	if errv := bmp.i2cWrite(RegisterControl, bmp.control); errv != nil {
+		return fmt.Errorf("BMP280 Error: Couldn't apply Humidity Oversampling: %s", errv)
 	}
 	return nil
 }

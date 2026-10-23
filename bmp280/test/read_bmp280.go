@@ -20,12 +20,15 @@ func main() {
 
 	defer bmp.Close()
 	//fmt.Println("BMP280 initialized successfully")
-	fmt.Println("t,temp,press,alt")
+	if bmp.HasHumiditySensor() {
+		fmt.Println("BME280 detected: humidity readings available")
+	}
+	fmt.Println("t,temp,press,hum,alt")
 
 	clock := time.NewTicker(bmp.Delay)
 	for {
 		<-clock.C
 		cur = <-bmp.C
-		fmt.Printf("%v,%3.2f,%4.2f,%5.1f\n", cur.T, cur.Temperature, cur.Pressure, bmp280.CalcAltitude(cur.Pressure))
+		fmt.Printf("%v,%3.2f,%4.2f,%3.1f,%5.1f\n", cur.T, cur.Temperature, cur.Pressure, cur.Humidity, bmp280.CalcAltitude(cur.Pressure))
 	}
 }

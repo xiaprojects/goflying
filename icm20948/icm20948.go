@@ -162,13 +162,23 @@ func NewICM20948(i2cbus *embd.I2CBus, sensitivityGyro, sensitivityAccel, sampleR
 	}
 
 	sampRate := byte(1125/mpu.sampleRate - 1)
-	// Default: Set Gyro LPF to half of sample rate
-	if err := mpu.SetGyroLPF(sampRate >> 1); err != nil {
+
+	// Set the gyro and accel low pass filters to half the sample rate (Nyquist),
+	// for anti-aliasing.
+	// NOTE: SetGyroLPF/SetAccelLPF take a cutoff frequency in Hz, NOT the
+	// sample rate divider. Passing the divider here (the old behaviour) selected
+	// the narrowest 6 Hz / 5 Hz filters at every realistic sample rate, which
+	// added several hundred ms of group delay to the attitude solution.
+	lpf := mpu.sampleRate / 2
+	if lpf > math.MaxUint8 {
+		lpf = math.MaxUint8 // The widest DLPF is already selected well below this.
+	}
+
+	if err := mpu.SetGyroLPF(byte(lpf)); err != nil {
 		return nil, err
 	}
 
-	// Default: Set Accel LPF to half of sample rate
-	if err := mpu.SetAccelLPF(sampRate >> 1); err != nil {
+	if err := mpu.SetAccelLPF(byte(lpf)); err != nil {
 		return nil, err
 	}
 
@@ -542,8 +552,11 @@ func (mpu *ICM20948) SetGyroLPF(rate byte) (err error) {
 		r = BITS_DLPF_GYRO_CFG_6HZ
 	}
 
-	cfg |= 0x01
-	cfg |= r
+	// Clear the old DLPFCFG/FCHOICE bits before OR-ing in the new ones, keeping
+	// GYRO_FS_SEL intact. A plain OR could only ever add bits, so a second call
+	// was able to narrow the filter but never widen it again.
+	cfg &^= BITS_ICM_DLPF_MASK
+	cfg |= r // r already carries FCHOICE=1 to enable the DLPF
 
 	errWrite := mpu.i2cWrite(ICMREG_GYRO_CONFIG, cfg)
 	if errWrite != nil {
@@ -583,8 +596,10 @@ func (mpu *ICM20948) SetAccelLPF(rate byte) (err error) {
 		r = BITS_DLPF_ACCEL_CFG_5HZ
 	}
 
-	cfg |= 0x01
-	cfg |= r
+	// Clear the old DLPFCFG/FCHOICE bits before OR-ing in the new ones, keeping
+	// ACCEL_FS_SEL intact. See SetGyroLPF.
+	cfg &^= BITS_ICM_DLPF_MASK
+	cfg |= r // r already carries FCHOICE=1 to enable the DLPF
 
 	errWrite := mpu.i2cWrite(ICMREG_ACCEL_CONFIG, cfg)
 	if errWrite != nil {
@@ -648,10 +663,24 @@ func (mpu *ICM20948) SetGyroSensitivity(sensitivityGyro int) (err error) {
 		sensGyro = BITS_FS_250DPS
 		mpu.scaleGyro = 250.0 / float64(math.MaxInt16)
 	default:
-		err = fmt.Errorf("ICM20948 Error: %d is not a valid gyro sensitivity", sensitivityGyro)
+		// Bail out rather than fall through: writing sensGyro==0 here would
+		// silently configure 250 dps while leaving scaleGyro at 0, which zeroes
+		// every gyro reading. NewICM20948 only logs this error, so it must not
+		// leave the chip half-configured.
+		return fmt.Errorf("ICM20948 Error: %d is not a valid gyro sensitivity", sensitivityGyro)
 	}
 
-	if errWrite := mpu.i2cWrite(ICMREG_GYRO_CONFIG, sensGyro); errWrite != nil {
+	// Read-modify-write: GYRO_CONFIG_1 also holds DLPFCFG and FCHOICE, so
+	// writing the range on its own would silently disable the low pass filter
+	// for any caller that changes sensitivity after initialization.
+	cfg, errRead := mpu.i2cRead(ICMREG_GYRO_CONFIG)
+	if errRead != nil {
+		return errors.New("ICM20948 Error: couldn't read gyro config")
+	}
+	cfg &^= BITS_ICM_FS_SEL_MASK
+	cfg |= sensGyro
+
+	if errWrite := mpu.i2cWrite(ICMREG_GYRO_CONFIG, cfg); errWrite != nil {
 		err = errors.New("ICM20948 Error: couldn't set gyro sensitivity")
 	}
 
@@ -691,7 +720,17 @@ func (mpu *ICM20948) SetAccelSensitivity(sensitivityAccel int) error {
 		return fmt.Errorf("ICM20948 Error: %d is not a valid accel sensitivity", sensitivityAccel)
 	}
 
-	if errWrite := mpu.i2cWrite(ICMREG_ACCEL_CONFIG, sensAccel); errWrite != nil {
+	// Read-modify-write: ACCEL_CONFIG also holds DLPFCFG and FCHOICE, so
+	// writing the range on its own would silently disable the low pass filter
+	// for any caller that changes sensitivity after initialization.
+	cfg, errRead := mpu.i2cRead(ICMREG_ACCEL_CONFIG)
+	if errRead != nil {
+		return errors.New("ICM20948 Error: couldn't read accel config")
+	}
+	cfg &^= BITS_ICM_FS_SEL_MASK
+	cfg |= sensAccel
+
+	if errWrite := mpu.i2cWrite(ICMREG_ACCEL_CONFIG, cfg); errWrite != nil {
 		return errors.New("ICM20948 Error: couldn't set accel sensitivity")
 	}
 

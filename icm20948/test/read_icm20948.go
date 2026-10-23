@@ -21,7 +21,9 @@ func main() {
 	i2cbus := embd.NewI2CBus(1)
 
 	for i := 0; i < 10; i++ {
-		mpu, err = icm20948.NewICM20948(&i2cbus, 250, 4, 50, true, false)
+		// 250 dps gyro, +/-8G accel, 50 Hz sample rate (LPF is set to
+		// half the sample rate automatically).
+		mpu, err = icm20948.NewICM20948(&i2cbus, 250, 8, 50, true, false)
 		if err != nil {
 			fmt.Printf("Error initializing ICM20948, attempt %d of 10\n", i)
 			time.Sleep(5 * time.Second)

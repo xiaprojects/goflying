@@ -181,13 +181,23 @@ func NewMPU9250(i2cbus *embd.I2CBus, sensitivityGyro, sensitivityAccel, sampleRa
 	}
 
 	sampRate := byte(1000/mpu.sampleRate - 1)
-	// Default: Set Gyro LPF to half of sample rate
-	if err := mpu.SetGyroLPF(sampRate >> 1); err != nil {
+
+	// Set the gyro and accel low pass filters to half the sample rate (Nyquist),
+	// for anti-aliasing.
+	// NOTE: SetGyroLPF/SetAccelLPF take a cutoff frequency in Hz, NOT the
+	// sample rate divider. Passing the divider here (the old behaviour) selected
+	// the narrowest 5 Hz filter at every realistic sample rate, which added
+	// several hundred ms of group delay to the attitude solution.
+	lpf := mpu.sampleRate / 2
+	if lpf > math.MaxUint8 {
+		lpf = math.MaxUint8 // The widest DLPF (188 Hz) is already selected well below this.
+	}
+
+	if err := mpu.SetGyroLPF(byte(lpf)); err != nil {
 		return nil, err
 	}
 
-	// Default: Set Accel LPF to half of sample rate
-	if err := mpu.SetAccelLPF(sampRate >> 1); err != nil {
+	if err := mpu.SetAccelLPF(byte(lpf)); err != nil {
 		return nil, err
 	}
 
@@ -609,7 +619,11 @@ func (mpu *MPU9250) SetGyroSensitivity(sensitivityGyro int) (err error) {
 		sensGyro = BITS_FS_250DPS
 		mpu.scaleGyro = 250.0 / float64(math.MaxInt16)
 	default:
-		err = fmt.Errorf("MPU9250 Error: %d is not a valid gyro sensitivity", sensitivityGyro)
+		// Bail out rather than fall through: writing sensGyro==0 here would
+		// silently configure 250 dps while leaving scaleGyro at 0, which zeroes
+		// every gyro reading. NewMPU9250 only logs this error, so it must not
+		// leave the chip half-configured.
+		return fmt.Errorf("MPU9250 Error: %d is not a valid gyro sensitivity", sensitivityGyro)
 	}
 
 	if errWrite := mpu.i2cWrite(MPUREG_GYRO_CONFIG, sensGyro); errWrite != nil {
@@ -638,7 +652,8 @@ func (mpu *MPU9250) SetAccelSensitivity(sensitivityAccel int) (err error) {
 		sensAccel = BITS_FS_2G
 		mpu.scaleAccel = 2.0 / float64(math.MaxInt16)
 	default:
-		err = fmt.Errorf("MPU9250 Error: %d is not a valid accel sensitivity", sensitivityAccel)
+		// Bail out rather than fall through: see SetGyroSensitivity.
+		return fmt.Errorf("MPU9250 Error: %d is not a valid accel sensitivity", sensitivityAccel)
 	}
 
 	if errWrite := mpu.i2cWrite(MPUREG_ACCEL_CONFIG, sensAccel); errWrite != nil {
