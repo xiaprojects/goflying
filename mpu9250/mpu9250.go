@@ -10,6 +10,7 @@ import (
 	"log"
 	"math"
 	"os"
+	"sync"
 	"time"
 
 	"github.com/kidoman/embd"
@@ -112,6 +113,7 @@ type MPU9250 struct {
 	CAvg                <-chan *MPUData // Average sensor values (since CAvg last read)
 	CBuf                <-chan *MPUData // Buffer of instantaneous sensor values
 	cClose              chan bool       // Turn off MPU polling
+	closeOnce           sync.Once       // CloseMPU stops the read goroutine once
 }
 
 // tempConversion returns the die temperature conversion, degC = raw*scale +
@@ -357,6 +359,7 @@ func (mpu *MPU9250) readSensors() {
 	defer clock.Stop()
 
 	clockMag := time.NewTicker(time.Duration(int(1000.0/float32(magSampleRate)+0.5)) * time.Millisecond)
+	defer clockMag.Stop()
 	t0 = time.Now()
 	t0m = time.Now()
 
@@ -431,7 +434,9 @@ func (mpu *MPU9250) readSensors() {
 				}
 			}
 			curdata = makeMPUData()
-			// Update accumulated values and increment count of gyro/accel readings
+			// Update accumulated values and increment count of gyro/accel readings.
+			// The magnetometer sums are the mag tick's alone: m1..m3 here are
+			// only its last sample, which nm does not count.
 			avg1 += float64(g1)
 			avg2 += float64(g2)
 			avg3 += float64(g3)
@@ -439,9 +444,6 @@ func (mpu *MPU9250) readSensors() {
 			ava2 += float64(a2)
 			ava3 += float64(a3)
 			avtmp += float64(tmp)
-			avm1 += int32(m1)
-			avm2 += int32(m2)
-			avm3 += int32(m3)
 			n++
 			select {
 			case cBuf <- curdata: // We update the buffer every time we read a new value.
@@ -500,16 +502,19 @@ func (mpu *MPU9250) readSensors() {
 			n, nm = 0, 0
 			t0, t0m = t, tm
 		case <-mpu.cClose: // Stop the goroutine, ease up on the CPU
-			break
+			return // A bare break would only leave the select and keep polling
 		}
 	}
 }
 
-// CloseMPU stops the driver from reading the MPU.
+// CloseMPU stops the driver from reading the MPU.  It returns once the read
+// goroutine has done its last bus transaction; the goroutine then closes C,
+// CAvg and CBuf, so a receive on them returns nil, ok false.  Calling it again
+// does nothing.
 //TODO westphae: need a way to start it going again!
 func (mpu *MPU9250) CloseMPU() {
 	// Nothing to do bitwise for the 9250?
-	mpu.cClose <- true
+	mpu.closeOnce.Do(func() { mpu.cClose <- true })
 }
 
 // SetSampleRate changes the sampling rate of the MPU.
