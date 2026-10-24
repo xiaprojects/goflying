@@ -13,6 +13,10 @@ import "math"
 //     C the daemon calibrates is the accelerometer reading at level, not the
 //     bias the filter's C state is, so it goes into the scale and the bias
 //     state starts at zero.
+//   - The sensor quaternion is SimpleState's: its f carries a chip-frame
+//     vector into the aircraft frame (rotateByF).  The filter's measurement
+//     model runs the other way, chip = f * aircraft, so F is conjugated on
+//     the way in and out.
 //   - The earth field N is pinned through SetConfig ("MagField" in uT and
 //     "MagDip" in degrees, positive down); the heading is then magnetic.
 //     Without it N is a free state and any heading error can be absorbed by
@@ -92,7 +96,7 @@ func (s *KalmanAHRS) initialise(m *Measurement) {
 	s.init(m)
 	s.T = m.T // init leaves it zero, which would read as stale at once
 	if s.f != nil {
-		s.F0, s.F1, s.F2, s.F3 = s.f[0], s.f[1], s.f[2], s.f[3]
+		s.F0, s.F1, s.F2, s.F3 = s.f[0], -s.f[1], -s.f[2], -s.f[3]
 		s.normalize()
 	}
 	s.D1, s.D2, s.D3 = s.d[0], s.d[1], s.d[2]
@@ -143,8 +147,9 @@ func (s *KalmanAHRS) Compute(m *Measurement) {
 	s.KalmanState.Compute(mm)
 
 	// Slip/skid and g-load from the measured acceleration in the aircraft
-	// frame, as SimpleState reports them: the reaction, so -A.
-	_, a2, a3 := s.rotateByF(-mm.A1, -mm.A2, -mm.A3)
+	// frame, as SimpleState reports them from -A: adjust has already negated
+	// and scaled it.
+	_, a2, a3 := s.toAircraft(mm.A1, mm.A2, mm.A3)
 	s.slipSkid += slowSmoothConst * (math.Atan2(a2, -a3) - s.slipSkid)
 	s.gLoad += slowSmoothConst * (-a3 - s.gLoad)
 	s.updateLogMap(mm)
@@ -205,19 +210,29 @@ func (s *KalmanAHRS) GLoad() float64 {
 	return s.gLoad
 }
 
-// SetSensorQuaternion sets the sensor-to-aircraft rotation F.
+// toAircraft carries a chip-frame vector into the aircraft frame: the
+// transpose of the filter's f, see the type comment.
+func (s *KalmanAHRS) toAircraft(a1, a2, a3 float64) (z1, z2, z3 float64) {
+	z1 = s.f11*a1 + s.f21*a2 + s.f31*a3
+	z2 = s.f12*a1 + s.f22*a2 + s.f32*a3
+	z3 = s.f13*a1 + s.f23*a2 + s.f33*a3
+	return
+}
+
+// SetSensorQuaternion sets the sensor quaternion, as SimpleState takes it.
 func (s *KalmanAHRS) SetSensorQuaternion(f *[4]float64) {
 	ff := *f
 	s.f = &ff
 	if !s.needsInit {
-		s.F0, s.F1, s.F2, s.F3 = ff[0], ff[1], ff[2], ff[3]
+		s.F0, s.F1, s.F2, s.F3 = ff[0], -ff[1], -ff[2], -ff[3]
 		s.normalize()
 	}
 }
 
-// GetSensorQuaternion returns the sensor-to-aircraft rotation F.
+// GetSensorQuaternion returns the sensor quaternion, as SimpleState takes it,
+// with whatever the filter has refined it to.
 func (s *KalmanAHRS) GetSensorQuaternion() *[4]float64 {
-	return &[4]float64{s.F0, s.F1, s.F2, s.F3}
+	return &[4]float64{s.F0, -s.F1, -s.F2, -s.F3}
 }
 
 // SetCalibrations takes the accelerometer reading at level c, whose norm
